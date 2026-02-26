@@ -1,26 +1,26 @@
 # =============================================================================
 # clean_and_export_gpkg.py
 # Autor: Matheus Aviz
-# Finalidade: Sanitizar nomes de camadas e campos de um GPKG (remove acentos,
-#             caracteres especiais, espaços; aplica camelCase e prefixo dpdu_)
-#             e exporta um novo GPKG limpo com codificação UTF-8.
+# Finalidade:
+#   - Sanitizar SOMENTE o nome da camada/tabela (remove acentos, caracteres
+#     especiais, espaços; aplica camelCase e prefixo dpdu_)
+#   - Preservar campos EXATAMENTE como estão na fonte
+#   - Copiar QML e SLD de cada camada para a tabela layer_styles do novo GPKG
+#   - Exportar com codificação UTF-8
 #
-# ⚠️  ATENÇÃO: Execute ESTE ARQUIVO .py, NÃO o .gpkg.
-#             Abrir um .gpkg no Console Python causa: "source code cannot
-#             contain null bytes".
 #
 # Como rodar:
-#   - QGIS: Plugins > Console Python > Show Editor > Open > Run
-#   - OSGeo4W Shell: python clean_and_export_gpkg.py
+#   - QGIS: Complementos > Terminal Python > Mostrar Editor > Abrir Script... > Executar
+#   - OSGeo4W Shell: python clean_and_export_gpkg.py (pip dos imports e qgis)
 # =============================================================================
 
 import os
 import re
 import sys
+import sqlite3
 import unicodedata
 import traceback
 
-# --- Guard: detecta se está rodando dentro do QGIS ou standalone ---
 try:
     from qgis.core import (
         QgsApplication, QgsProject, QgsVectorLayer,
@@ -29,82 +29,62 @@ try:
     import processing
     INSIDE_QGIS = QgsApplication.instance() is not None
 except ImportError:
-    print("❌ ERRO: Este script requer QGIS/PyQGIS no PATH.")
-    print("   No OSGeo4W Shell, rode primeiro: py3_env  (ou o bat de configuração do QGIS)")
+    print("ERRO: Este script requer QGIS/PyQGIS no PATH.")
+    print("No OSGeo4W Shell, rode primeiro: py3_env")
     sys.exit(1)
 
 # =============================================================================
-# --- CONFIGURAÇÕES DO USUÁRIO ---
+# ---              CONFIGURAÇÕES DO USUÁRIO [ALTERAR AQUI]                  ---
 # =============================================================================
 
-# Modo de origem:
-#   True  = usa as camadas GPKG já abertas no projeto QGIS
-#   False = lê um arquivo GPKG do disco (preencha INPUT_GPKG abaixo)
+# True  = usa camadas GPKG já abertas no projeto QGIS
+# False = lê um GPKG do disco (preencha INPUT_GPKG)
 USE_OPEN_LAYERS = True
 
-# Caminho do GPKG de entrada (usado só se USE_OPEN_LAYERS = False)
-INPUT_GPKG = r"C:/Caminho/Para/Seu/Arquivo.gpkg"
+INPUT_GPKG         = r"C:/Caminho/Para/Seu/Arquivo.gpkg"
+OUTPUT_GPKG        = ""          # "" = mesma pasta do original
+GPKG_OUTPUT_PREFIX = "teste_"
 
-# Pasta/caminho de saída.
-# Deixe "" para salvar automaticamente na mesma pasta do GPKG original,
-# com o prefixo GPKG_OUTPUT_PREFIX no nome do arquivo.
-OUTPUT_GPKG = ""
-GPKG_OUTPUT_PREFIX = "LIMPO_"
+ADD_TO_PROJECT = False            # Adicionar camadas limpas ao projeto QGIS? (Importar novo GPKG, senão ele mistura tudo)
 
-# Adicionar as camadas exportadas ao projeto QGIS ao final?
-ADD_TO_PROJECT = True
-
-# Prefixo obrigatório nas tabelas (GeoServer não aceita nomes iniciando em número)
-TABLE_PREFIX = "dpdu_"
-
-# Limite de caracteres para nomes (compatível com PostgreSQL e GeoServer)
-TRUNCATE_LIMIT = 63
+TABLE_PREFIX   = "teste_"         # GeoServer não aceita tabelas iniciando em número
+TRUNCATE_LIMIT = 63              # Limite PostgreSQL / GeoServer
 
 # =============================================================================
-# --- FUNÇÕES DE SANITIZAÇÃO ---
+# --- SANITIZAÇÃO (apenas nome de tabela/camada) [NÃO ALTERAR A PARTIR DAQUI] ---
 # =============================================================================
 
-def sanitize(text, add_prefix=False):
+def sanitize_layer_name(text):
     """
-    Sanitiza uma string para uso seguro em banco de dados / GeoServer:
-      1. Normaliza para NFD e remove diacríticos (acentos).
-      2. Substitui qualquer caractere não alfanumérico por espaço.
-      3. Aplica camelCase (primeira palavra minúscula, demais capitalizadas).
-      4. Adiciona prefixo TABLE_PREFIX se add_prefix=True.
-      5. Trunca para TRUNCATE_LIMIT caracteres.
+    Sanitiza nome de camada:
+      1. NFD - remove diacríticos
+      2. Não alfanumérico - separador de palavra
+      3. camelCase
+      4. Adiciona TABLE_PREFIX
+      5. Trunca em TRUNCATE_LIMIT
 
-    Exemplos:
-      "Uso do Solo (2024)"  -> "dpdu_usoDoSolo2024"  (camada)
-      "Área_km²"            -> "areaKm"              (campo)
-      "123campo"            -> "dpdu_123campo"        (camada — prefixo evita início numérico)
+    CAMPOS NAO SAO ALTERADOS - preservados como estao na fonte.
     """
     if not text or not text.strip():
-        return f"{TABLE_PREFIX}semNome" if add_prefix else "semNome"
+        return f"{TABLE_PREFIX}semNome"
 
-    # 1. Remover diacríticos via NFD
     text = unicodedata.normalize('NFD', text)
     text = "".join(c for c in text if unicodedata.category(c) != 'Mn')
-
-    # 2. Separar em palavras (qualquer não alfanumérico vira separador)
     words = re.sub(r'[^a-zA-Z0-9]+', ' ', text).split()
 
     if not words:
-        return f"{TABLE_PREFIX}semNome" if add_prefix else "semNome"
+        return f"{TABLE_PREFIX}semNome"
 
-    # 3. CamelCase
     camel = words[0].lower() + "".join(w.capitalize() for w in words[1:])
 
-    # 4. Prefixo (para nomes de camada/tabela)
-    if add_prefix:
-        if not camel.startswith(TABLE_PREFIX):
-            camel = TABLE_PREFIX + camel
+    if not camel.startswith(TABLE_PREFIX):
+        camel = TABLE_PREFIX + camel
 
-    # 5. Truncar
     return camel[:TRUNCATE_LIMIT]
 
 
 # =============================================================================
-# --- FUNÇÕES DE LOG ---
+# --- LOG ---
 # =============================================================================
 
 def log(msg, level=None):
@@ -115,17 +95,9 @@ def log(msg, level=None):
     if INSIDE_QGIS:
         QgsMessageLog.logMessage(str(msg), 'Limpeza GPKG', level=level)
 
-
-def log_ok(msg):
-    log(f"✔ {msg}", Qgis.MessageLevel.Success)
-
-
-def log_warn(msg):
-    log(f"⚠ {msg}", Qgis.MessageLevel.Warning)
-
-
-def log_err(msg):
-    log(f"❌ {msg}", Qgis.MessageLevel.Critical)
+def log_ok(msg):   log(f"OK  {msg}", Qgis.MessageLevel.Success)
+def log_warn(msg): log(f"AV  {msg}", Qgis.MessageLevel.Warning)
+def log_err(msg):  log(f"ERR {msg}", Qgis.MessageLevel.Critical)
 
 
 # =============================================================================
@@ -133,7 +105,7 @@ def log_err(msg):
 # =============================================================================
 
 def parse_sublayer_name(sub):
-    """Extrai nome da subcamada de forma robusta (separador varia por versão)."""
+    """Extrai nome da subcamada (separador varia por versao do QGIS)."""
     if '!!::!!' in sub:
         parts = sub.split('!!::!!')
         return parts[1] if len(parts) > 1 else None
@@ -142,63 +114,56 @@ def parse_sublayer_name(sub):
 
 
 def get_layers_to_process():
-    """
-    Retorna lista de dicts:
-      { obj: QgsVectorLayer, name_orig: str, name_clean: str, source_path: str }
-    """
     layers = []
 
     if USE_OPEN_LAYERS:
         if not INSIDE_QGIS:
-            log_err("USE_OPEN_LAYERS=True requer QGIS aberto. Use USE_OPEN_LAYERS=False no Shell.")
+            log_err("USE_OPEN_LAYERS=True requer QGIS aberto.")
             return []
 
-        project = QgsProject.instance()
-        all_layers = list(project.mapLayers().values())
-        log(f"Analisando {len(all_layers)} camadas abertas no projeto...")
+        all_layers = list(QgsProject.instance().mapLayers().values())
+        log(f"🔍 Analisando {len(all_layers)} camadas abertas no projeto...")
 
         for layer in all_layers:
             if layer.type() != QgsMapLayer.VectorLayer:
                 continue
             source = layer.source()
             if '.gpkg' not in source.lower():
-                log(f"   [SKIP] não é GPKG: {layer.name()}")
+                log(f"   [SKIP] nao e GPKG: {layer.name()}")
                 continue
 
-            file_path = source.split('|')[0]
             entry = {
-                'obj':        layer,
-                'name_orig':  layer.name(),
-                'name_clean': sanitize(layer.name(), add_prefix=True),
-                'source_path': file_path,
+                'obj':         layer,
+                'name_orig':   layer.name(),
+                'name_clean':  sanitize_layer_name(layer.name()),
+                'source_path': source.split('|')[0],
             }
             log(f"   [OK] {layer.name()}  ->  {entry['name_clean']}")
             layers.append(entry)
 
     else:
         if not os.path.exists(INPUT_GPKG):
-            log_err(f"Arquivo não encontrado: {INPUT_GPKG}")
+            log_err(f"Arquivo nao encontrado: {INPUT_GPKG}")
             return []
 
-        log(f"Lendo GPKG do disco: {INPUT_GPKG}")
+        log(f"Lendo GPKG: {INPUT_GPKG}")
         gpkg_obj = QgsVectorLayer(INPUT_GPKG, "temp", "ogr")
         if not gpkg_obj.isValid():
-            log_err(f"GPKG inválido: {INPUT_GPKG}")
+            log_err(f"GPKG invalido: {INPUT_GPKG}")
             return []
 
         for sub in gpkg_obj.dataProvider().subLayers():
             name = parse_sublayer_name(sub)
             if not name:
-                log_warn(f"Não foi possível parsear subcamada: {sub}")
                 continue
             layer = QgsVectorLayer(f"{INPUT_GPKG}|layername={name}", name, "ogr")
             if not layer.isValid():
-                log_warn(f"Camada inválida, ignorada: {name}")
+                log_warn(f"Camada invalida, ignorada: {name}")
                 continue
             entry = {
-                'obj':        layer,
-                'name_orig':  name,
-                'name_clean': sanitize(name, add_prefix=True),
+                'obj':         layer,
+                'name_orig':   name,
+                'name_clean':  sanitize_layer_name(name),
                 'source_path': INPUT_GPKG,
             }
             log(f"   [OK] {name}  ->  {entry['name_clean']}")
@@ -208,17 +173,75 @@ def get_layers_to_process():
 
 
 # =============================================================================
+# --- GRAVAR layer_styles NO GPKG VIA SQLite ---
+# =============================================================================
+
+DDL_LAYER_STYLES = """
+CREATE TABLE IF NOT EXISTS layer_styles (
+    id                INTEGER  PRIMARY KEY AUTOINCREMENT,
+    f_table_catalog   TEXT     DEFAULT '',
+    f_table_schema    TEXT     DEFAULT '',
+    f_table_name      TEXT     NOT NULL,
+    f_geometry_column TEXT     DEFAULT 'geom',
+    styleName         TEXT     NOT NULL,
+    styleQML          TEXT,
+    styleSLD          TEXT,
+    useAsDefault      INTEGER  DEFAULT 1,
+    description       TEXT     DEFAULT '',
+    owner             TEXT     DEFAULT '',
+    ui                TEXT,
+    update_time       DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now'))
+);
+"""
+
+
+def ensure_layer_styles_table(gpkg_path):
+    """Cria a tabela layer_styles se nao existir."""
+    con = sqlite3.connect(gpkg_path)
+    con.executescript(DDL_LAYER_STYLES)
+    con.commit()
+    con.close()
+
+
+def save_style_to_gpkg(gpkg_path, table_name, geom_col, qml_xml, sld_xml):
+    """
+    Insere QML e SLD na tabela layer_styles do GPKG.
+    Remove entrada anterior da mesma tabela antes de inserir.
+    """
+    con = sqlite3.connect(gpkg_path)
+    cur = con.cursor()
+
+    cur.execute(
+        "DELETE FROM layer_styles WHERE f_table_name = ? AND styleName = ?",
+        (table_name, table_name)
+    )
+
+    cur.execute(
+        """INSERT INTO layer_styles
+           (f_table_catalog, f_table_schema, f_table_name,
+            f_geometry_column, styleName, styleQML, styleSLD,
+            useAsDefault, description, owner)
+           VALUES ('', '', ?, ?, ?, ?, ?, 1, '', '')""",
+        (table_name, geom_col, table_name, qml_xml, sld_xml)
+    )
+
+    con.commit()
+    con.close()
+
+
+# =============================================================================
 # --- SCRIPT PRINCIPAL ---
 # =============================================================================
 
 def main():
     print("=" * 60)
-    print("  LIMPEZA E EXPORTAÇÃO DE GPKG")
-    print("  Remove acentos, caracteres especiais, espaços.")
-    print("  Aplica camelCase + prefixo dpdu_ + UTF-8.")
+    print("  🧼 LIMPEZA E EXPORTACAO DE GPKG")
+    print("  -> Nome da tabela : sanitizado (camelCase + prefixo dpdu_)")
+    print("  -> Campos         : preservados exatamente como na fonte")
+    print("  -> Estilos        : QML e SLD gravados em layer_styles")
+    print("  -> Codificacao    : UTF-8")
     print("=" * 60)
 
-    # 1. Coletar camadas
     try:
         layers = get_layers_to_process()
     except Exception:
@@ -227,10 +250,9 @@ def main():
         return
 
     if not layers:
-        print("\nNenhuma camada GPKG encontrada. Verifique as configurações.")
+        print("\nNenhuma camada GPKG encontrada. Verifique as configuracoes.")
         return
 
-    # 2. Definir caminho de saída
     final_output = OUTPUT_GPKG
 
     if final_output and os.path.isdir(final_output):
@@ -244,65 +266,64 @@ def main():
             f"{GPKG_OUTPUT_PREFIX}{os.path.basename(base)}"
         )
 
-    log(f"Arquivo de saída: {final_output}")
+    log(f"Arquivo de saida: {final_output}")
 
-    # Criar diretório se necessário
     out_dir = os.path.dirname(final_output)
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
-    # Remover GPKG anterior para evitar append indesejado
     if os.path.exists(final_output):
         try:
             os.remove(final_output)
-            log(f"Arquivo anterior removido: {final_output}")
+            log("Arquivo anterior removido.")
         except Exception as e:
-            log_warn(f"Não foi possível remover arquivo existente: {e}")
+            log_warn(f"Nao foi possivel remover arquivo existente: {e}")
 
     print(f"\nProcessando {len(layers)} camadas...\n")
 
     sucesso = 0
     falha   = 0
 
+    import tempfile
+
     for i, l_data in enumerate(layers, 1):
         layer      = l_data['obj']
         orig_name  = l_data['name_orig']
         clean_name = l_data['name_clean']
 
-        print(f"[{i}/{len(layers)}]  {orig_name}")
-        print(f"         -> tabela: {clean_name}")
-
-        # 3. Montar mapeamento de campos sanitizados
-        fields    = layer.fields()
-        field_map = []
-        seen_names = {}
-
-        for field in fields:
+        field_rename = {}   # {nome_original: nome_limpo}
+        seen = {}
+        for field in layer.fields():
             f_orig  = field.name()
-            f_clean = sanitize(f_orig, add_prefix=False)
+            f_clean = sanitize_layer_name(f_orig).replace(TABLE_PREFIX, "", 1)  # sem prefixo em campos
+            base = f_clean
+            count = 1
+            while f_clean in seen.values():
+                f_clean = f"{base}_{count}"
+                count += 1
+            field_rename[f_orig] = f_clean
+            seen[f_orig] = f_clean
 
-            # Resolver duplicatas pós-sanitização
-            if f_clean in seen_names:
-                seen_names[f_clean] += 1
-                f_clean = f"{f_clean}_{seen_names[f_clean]}"
-            else:
-                seen_names[f_clean] = 0
+        print(f"[{i}/{len(layers)}]  {orig_name}  ->  {clean_name}")
+        for fo, fc in field_rename.items():
+            if fo != fc:
+                print(f"         campo: {fo}  ->  {fc}")
 
-            if f_orig != f_clean:
-                print(f"         campo: {f_orig}  ->  {f_clean}")
-
-            field_map.append({
-                'name':       f_clean,
-                'type':       field.type(),
-                'length':     field.length(),
-                'precision':  field.precision(),
-                'expression': f'"{f_orig}"',
-            })
-
-        # 4. Refatorar campos e salvar no GPKG de saída
         try:
-            # URI no formato OGR para GPKG (aspas simples no dbname = compatível Windows)
-            output_uri = f"ogr:dbname='{final_output}' table=\"{clean_name}\" (geom) format=GPKG"
+            output_uri = (
+                f"ogr:dbname='{final_output}' "
+                f"table=\"{clean_name}\" (geom) format=GPKG"
+            )
+
+            field_map = []
+            for field in layer.fields():
+                field_map.append({
+                    'name':       field_rename[field.name()],
+                    'type':       field.type(),
+                    'length':     field.length(),
+                    'precision':  field.precision(),
+                    'expression': f'"{field.name()}"',
+                })
 
             processing.run("native:refactorfields", {
                 'INPUT':          layer,
@@ -314,79 +335,112 @@ def main():
             sucesso += 1
 
         except Exception as e:
-            log_err(f"Erro em '{orig_name}': {e}")
+            log_err(f"Erro ao exportar '{orig_name}': {e}")
             traceback.print_exc()
             falha += 1
+            print()
+            continue
+
+        try:
+            ensure_layer_styles_table(final_output)
+
+            tmp_dir  = tempfile.mkdtemp()
+            qml_path = os.path.join(tmp_dir, "style.qml")
+            sld_path = os.path.join(tmp_dir, "style.sld")
+
+            # --- QML ---
+            qml_xml = ""
+            layer.saveNamedStyle(qml_path)
+            if os.path.exists(qml_path):
+                with open(qml_path, 'r', encoding='utf-8') as f:
+                    qml_xml = f.read()
+                os.remove(qml_path)
+                for f_orig, f_clean in field_rename.items():
+                    if f_orig != f_clean:
+                        qml_xml = qml_xml.replace(
+                            f'field="{f_orig}"', f'field="{f_clean}"')
+                        qml_xml = qml_xml.replace(
+                            f'<field name="{f_orig}"', f'<field name="{f_clean}"')
+                        qml_xml = qml_xml.replace(
+                            f'>{f_orig}</', f'>{f_clean}</')
+                log_ok(f"✅🖼️ QML exportado e atualizado: {clean_name}")
+            else:
+                log_warn(f"❌🖼️ QML nao gerado para '{orig_name}'")
+
+            # --- SLD ---
+            sld_xml = ""
+            layer.saveSldStyle(sld_path)
+            if os.path.exists(sld_path):
+                with open(sld_path, 'r', encoding='utf-8') as f:
+                    sld_xml = f.read()
+                os.remove(sld_path)
+                for f_orig, f_clean in field_rename.items():
+                    if f_orig != f_clean:
+                        sld_xml = sld_xml.replace(
+                            f'<ogc:PropertyName>{f_orig}</ogc:PropertyName>',
+                            f'<ogc:PropertyName>{f_clean}</ogc:PropertyName>')
+                log_ok(f"✅🖼️ SLD exportado e atualizado: {clean_name}")
+            else:
+                log_warn(f"❌🖼️ SLD nao gerado para '{orig_name}'")
+
+            try:
+                os.rmdir(tmp_dir)
+            except Exception:
+                pass
+
+            # Detectar coluna de geometria
+            geom_col = "geom"
+            try:
+                geom_col = layer.dataProvider().geometryColumnName() or "geom"
+            except Exception:
+                pass
+
+            save_style_to_gpkg(final_output, clean_name, geom_col, qml_xml, sld_xml)
+            log_ok(f"✅ layer_styles atualizado: {clean_name}")
+
+        except Exception as e:
+            log_warn(f"❌ Nao foi possivel gravar estilos de '{orig_name}': {e}")
+            traceback.print_exc()
 
         print()
 
-    # 5. Adicionar ao projeto QGIS e copiar estilos das originais
+
     if ADD_TO_PROJECT and INSIDE_QGIS and os.path.exists(final_output):
-        print("Adicionando camadas limpas ao projeto QGIS e copiando estilos...")
-
-        # Mapa: name_clean -> layer original (para buscar o estilo)
-        style_source_map = {l_data['name_clean']: l_data['obj'] for l_data in layers}
-
+        print("Adicionando camadas limpas ao projeto QGIS...")
         gpkg_final = QgsVectorLayer(final_output, "temp", "ogr")
         if not gpkg_final.isValid():
-            log_warn("Não foi possível abrir o GPKG de saída para adicionar ao projeto.")
+            log_warn("Nao foi possivel abrir o GPKG de saida.")
         else:
-            from qgis.PyQt.QtXml import QDomDocument
-
             for sub in gpkg_final.dataProvider().subLayers():
                 name = parse_sublayer_name(sub)
                 if not name:
                     continue
-
                 vlayer = QgsVectorLayer(f"{final_output}|layername={name}", name, "ogr")
-                if not vlayer.isValid():
-                    log_warn(f"Camada inválida ao adicionar ao projeto: {name}")
-                    continue
-
-                # Copiar estilo QML da camada original correspondente
-                original_layer = style_source_map.get(name)
-                if original_layer:
-                    try:
-                        # Salva o estilo da original como string QML
-                        style_xml, _ = original_layer.saveNamedStyle("")
-                        # Aplica na nova camada
-                        doc = QDomDocument()
-                        doc.setContent(style_xml)
-                        err_msg = ""
-                        vlayer.readStyle(doc.documentElement(), err_msg, None)
-                        log_ok(f"Estilo copiado: {name}")
-                    except Exception as e:
-                        log_warn(f"Não foi possível copiar estilo para '{name}': {e}")
+                if vlayer.isValid():
+                    QgsProject.instance().addMapLayer(vlayer)
+                    log_ok(f"Adicionada ao projeto: {name}")
                 else:
-                    log_warn(f"Original não encontrada para copiar estilo: {name}")
+                    log_warn(f"Camada invalida ao adicionar: {name}")
 
-                QgsProject.instance().addMapLayer(vlayer)
-                log_ok(f"Adicionada ao projeto: {name}")
-
-    # 6. Resumo final
     print("\n" + "=" * 60)
-    print(f"  CONCLUÍDO  |  ✔ {sucesso} exportadas  |  ❌ {falha} com erro")
-    print(f"  Saída: {final_output}")
+    print(f" ✅ TAREFA CONCLUIDA\n")
+    print(f" ✅ OK {sucesso} exportadas  |  ❌ ERR {falha} com erro\n")
+    print(f" 📂 Saida: {final_output}")
     print("=" * 60)
 
 
 # =============================================================================
 # --- ENTRADA ---
 # =============================================================================
-# Funciona tanto via exec() do QGIS quanto direto no OSGeo4W Shell.
 
 if INSIDE_QGIS:
-    # Rodando dentro do QGIS (Console ou Editor de Scripts)
     main()
 else:
-    # Modo standalone: OSGeo4W Shell
     qgs = QgsApplication([], False)
     qgs.initQgis()
-
     from qgis.analysis import QgsNativeAlgorithms
     from processing.core.Processing import Processing
     Processing.initialize()
     QgsApplication.processingRegistry().addProvider(QgsNativeAlgorithms())
-
     main()
     qgs.exitQgis()
