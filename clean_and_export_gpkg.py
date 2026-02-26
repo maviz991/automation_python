@@ -5,6 +5,10 @@
 #             caracteres especiais, espaços; aplica camelCase e prefixo dpdu_)
 #             e exporta um novo GPKG limpo com codificação UTF-8.
 #
+# ⚠️  ATENÇÃO: Execute ESTE ARQUIVO .py, NÃO o .gpkg.
+#             Abrir um .gpkg no Console Python causa: "source code cannot
+#             contain null bytes".
+#
 # Como rodar:
 #   - QGIS: Plugins > Console Python > Show Editor > Open > Run
 #   - OSGeo4W Shell: python clean_and_export_gpkg.py
@@ -16,7 +20,7 @@ import sys
 import unicodedata
 import traceback
 
-# --- Guard ---
+# --- Guard: detecta se está rodando dentro do QGIS ou standalone ---
 try:
     from qgis.core import (
         QgsApplication, QgsProject, QgsVectorLayer,
@@ -30,7 +34,7 @@ except ImportError:
     sys.exit(1)
 
 # =============================================================================
-# ---              CONFIGURAÇÕES DO USUÁRIO [ALTERAR AQUI]                  ---
+# --- CONFIGURAÇÕES DO USUÁRIO ---
 # =============================================================================
 
 # Modo de origem:
@@ -70,9 +74,9 @@ def sanitize(text, add_prefix=False):
       5. Trunca para TRUNCATE_LIMIT caracteres.
 
     Exemplos:
-      "Uso do Solo (2024)"  -> "dpdu_usoDoSolo2024"          (camada)
-      "Área_km²"            -> "areaKm"                      (campo)
-      "123 Estradas"            -> "dpdu_123estradas"        (camada — prefixo evita início numérico)
+      "Uso do Solo (2024)"  -> "dpdu_usoDoSolo2024"  (camada)
+      "Área_km²"            -> "areaKm"              (campo)
+      "123campo"            -> "dpdu_123campo"        (camada — prefixo evita início numérico)
     """
     if not text or not text.strip():
         return f"{TABLE_PREFIX}semNome" if add_prefix else "semNome"
@@ -316,21 +320,48 @@ def main():
 
         print()
 
-    # 5. Adicionar ao projeto QGIS
+    # 5. Adicionar ao projeto QGIS e copiar estilos das originais
     if ADD_TO_PROJECT and INSIDE_QGIS and os.path.exists(final_output):
-        print("Adicionando camadas limpas ao projeto QGIS...")
+        print("Adicionando camadas limpas ao projeto QGIS e copiando estilos...")
+
+        # Mapa: name_clean -> layer original (para buscar o estilo)
+        style_source_map = {l_data['name_clean']: l_data['obj'] for l_data in layers}
+
         gpkg_final = QgsVectorLayer(final_output, "temp", "ogr")
-        if gpkg_final.isValid():
+        if not gpkg_final.isValid():
+            log_warn("Não foi possível abrir o GPKG de saída para adicionar ao projeto.")
+        else:
+            from qgis.PyQt.QtXml import QDomDocument
+
             for sub in gpkg_final.dataProvider().subLayers():
                 name = parse_sublayer_name(sub)
                 if not name:
                     continue
+
                 vlayer = QgsVectorLayer(f"{final_output}|layername={name}", name, "ogr")
-                if vlayer.isValid():
-                    QgsProject.instance().addMapLayer(vlayer)
-                    log_ok(f"Adicionada ao projeto: {name}")
-        else:
-            log_warn("Não foi possível abrir o GPKG de saída para adicionar ao projeto.")
+                if not vlayer.isValid():
+                    log_warn(f"Camada inválida ao adicionar ao projeto: {name}")
+                    continue
+
+                # Copiar estilo QML da camada original correspondente
+                original_layer = style_source_map.get(name)
+                if original_layer:
+                    try:
+                        # Salva o estilo da original como string QML
+                        style_xml, _ = original_layer.saveNamedStyle("")
+                        # Aplica na nova camada
+                        doc = QDomDocument()
+                        doc.setContent(style_xml)
+                        err_msg = ""
+                        vlayer.readStyle(doc.documentElement(), err_msg, None)
+                        log_ok(f"Estilo copiado: {name}")
+                    except Exception as e:
+                        log_warn(f"Não foi possível copiar estilo para '{name}': {e}")
+                else:
+                    log_warn(f"Original não encontrada para copiar estilo: {name}")
+
+                QgsProject.instance().addMapLayer(vlayer)
+                log_ok(f"Adicionada ao projeto: {name}")
 
     # 6. Resumo final
     print("\n" + "=" * 60)
@@ -358,4 +389,4 @@ else:
     QgsApplication.processingRegistry().addProvider(QgsNativeAlgorithms())
 
     main()
-    qgs.exitQgis()""
+    qgs.exitQgis()
